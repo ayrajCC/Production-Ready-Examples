@@ -1,0 +1,488 @@
+---
+# Namespace for CXone Healthcare Integration Services
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cxone-healthcare
+  labels:
+    app: cxone-healthcare
+    environment: production
+    compliance: hipaa
+
+---
+# ConfigMap for application configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: healthcare-config
+  namespace: cxone-healthcare
+data:
+  application.properties: |
+    cxone.api.url=https://api.nice-incontact.com/v1
+    integration.timeout=30000
+    cache.expiry.seconds=3600
+    metrics.enabled=true
+    telemetry.sampling.percentage=25
+    hipaa.compliance.level=strict
+    
+  logging.properties: |
+    log4j.rootLogger=INFO, console, file
+    log4j.appender.console=org.apache.log4j.ConsoleAppender
+    log4j.appender.console.layout=org.apache.log4j.PatternLayout
+    log4j.appender.console.layout.ConversionPattern=%d{yyyy-MM-dd HH:mm:ss} %-5p %c{1}:%L - %m%n
+    log4j.appender.file=org.apache.log4j.RollingFileAppender
+    log4j.appender.file.File=/var/log/healthcare-service/application.log
+    log4j.appender.file.MaxFileSize=10MB
+    log4j.appender.file.MaxBackupIndex=10
+    log4j.appender.file.layout=org.apache.log4j.PatternLayout
+    log4j.appender.file.layout.ConversionPattern=%d{yyyy-MM-dd HH:mm:ss} %-5p %c{1}:%L - %m%n
+
+---
+# Secret for API credentials and sensitive configuration
+apiVersion: v1
+kind: Secret
+metadata:
+  name: healthcare-api-credentials
+  namespace: cxone-healthcare
+type: Opaque
+data:
+  cxone-api-key: BASE64_ENCODED_API_KEY_HERE
+  fhir-client-id: BASE64_ENCODED_CLIENT_ID_HERE
+  fhir-client-secret: BASE64_ENCODED_CLIENT_SECRET_HERE
+  database-password: BASE64_ENCODED_DB_PASSWORD_HERE
+
+---
+# PersistentVolumeClaim for application data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: healthcare-data
+  namespace: cxone-healthcare
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard
+
+---
+# Service for API Gateway
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway
+  namespace: cxone-healthcare
+  labels:
+    app: api-gateway
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app: api-gateway
+
+---
+# Deployment for API Gateway
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: cxone-healthcare
+  labels:
+    app: api-gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api-gateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+    spec:
+      containers:
+        - name: api-gateway
+          image: nicecxone/healthcare-api-gateway:1.4.2
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          resources:
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: "production"
+            - name: CXONE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: healthcare-api-credentials
+                  key: cxone-api-key
+          volumeMounts:
+            - name: config-volume
+              mountPath: /app/config
+            - name: logs-volume
+              mountPath: /var/log/healthcare-service
+      volumes:
+        - name: config-volume
+          configMap:
+            name: healthcare-config
+        - name: logs-volume
+          persistentVolumeClaim:
+            claimName: healthcare-data
+
+---
+# Service for Appointment Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: appointment-service
+  namespace: cxone-healthcare
+  labels:
+    app: appointment-service
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app: appointment-service
+
+---
+# Deployment for Appointment Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: appointment-service
+  namespace: cxone-healthcare
+  labels:
+    app: appointment-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: appointment-service
+  template:
+    metadata:
+      labels:
+        app: appointment-service
+    spec:
+      containers:
+        - name: appointment-service
+          image: nicecxone/healthcare-appointment-service:2.1.0
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          resources:
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: "production"
+            - name: FHIR_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: healthcare-api-credentials
+                  key: fhir-client-id
+            - name: FHIR_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: healthcare-api-credentials
+                  key: fhir-client-secret
+          volumeMounts:
+            - name: config-volume
+              mountPath: /app/config
+            - name: logs-volume
+              mountPath: /var/log/healthcare-service
+      volumes:
+        - name: config-volume
+          configMap:
+            name: healthcare-config
+        - name: logs-volume
+          persistentVolumeClaim:
+            claimName: healthcare-data
+
+---
+# Service for Patient Lookup Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: patient-lookup-service
+  namespace: cxone-healthcare
+  labels:
+    app: patient-lookup-service
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app: patient-lookup-service
+
+---
+# Deployment for Patient Lookup Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: patient-lookup-service
+  namespace: cxone-healthcare
+  labels:
+    app: patient-lookup-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: patient-lookup-service
+  template:
+    metadata:
+      labels:
+        app: patient-lookup-service
+    spec:
+      containers:
+        - name: patient-lookup-service
+          image: nicecxone/healthcare-patient-service:1.8.1
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          resources:
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: "production"
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: healthcare-api-credentials
+                  key: database-password
+          volumeMounts:
+            - name: config-volume
+              mountPath: /app/config
+            - name: logs-volume
+              mountPath: /var/log/healthcare-service
+      volumes:
+        - name: config-volume
+          configMap:
+            name: healthcare-config
+        - name: logs-volume
+          persistentVolumeClaim:
+            claimName: healthcare-data
+
+---
+# HorizontalPodAutoscaler for API Gateway
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-gateway-hpa
+  namespace: cxone-healthcare
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-gateway
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+---
+# HorizontalPodAutoscaler for Appointment Service
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: appointment-service-hpa
+  namespace: cxone-healthcare
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: appointment-service
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+---
+# NetworkPolicy to restrict traffic
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: healthcare-network-policy
+  namespace: cxone-healthcare
+spec:
+  podSelector:
+    matchLabels:
+      app: api-gateway
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+        - podSelector:
+            matchLabels:
+              app: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: appointment-service
+      ports:
+        - protocol: TCP
+          port: 8080
+    - to:
+        - podSelector:
+            matchLabels:
+              app: patient-lookup-service
+      ports:
+        - protocol: TCP
+          port: 8080
+
+---
+# Ingress resource to expose the API
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: healthcare-api-ingress
+  namespace: cxone-healthcare
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, PUT, POST, DELETE, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "DNT,X-CustomHeader,Keep-Alive,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Authorization"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  tls:
+    - hosts:
+        - healthcare-api.cxone.example.com
+      secretName: healthcare-api-tls
+  rules:
+    - host: healthcare-api.cxone.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port:
+                  number: 80
+
+---
+# PodDisruptionBudget to ensure high availability during cluster operations
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-gateway-pdb
+  namespace: cxone-healthcare
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: api-gateway
+
+---
+# ResourceQuota to limit namespace resource usage
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: healthcare-quota
+  namespace: cxone-healthcare
+spec:
+  hard:
+    pods: "50"
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
